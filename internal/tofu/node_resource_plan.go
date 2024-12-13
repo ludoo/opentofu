@@ -11,14 +11,18 @@ import (
 	"strings"
 
 	"github.com/opentofu/opentofu/internal/addrs"
+	"github.com/opentofu/opentofu/internal/configs"
 	"github.com/opentofu/opentofu/internal/dag"
+	"github.com/opentofu/opentofu/internal/instances"
 	"github.com/opentofu/opentofu/internal/states"
 	"github.com/opentofu/opentofu/internal/tfdiags"
 )
 
-// nodeExpandPlannableResource represents an addrs.ConfigResource and implements
-// DynamicExpand to a subgraph containing all of the addrs.AbsResourceInstance
-// resulting from both the containing module and resource-specific expansion.
+// nodeExpandPlannableResource represents a static resource from the configuration,
+// before it has been expanded into multiple instances.
+//
+// It's responsible for determining the final set of instances for the resource
+// and then performing the planning logic for each one.
 type nodeExpandPlannableResource struct {
 	*NodeAbstractResource
 
@@ -479,4 +483,283 @@ func (n *nodeExpandPlannableResource) resourceInstanceSubgraph(ctx EvalContext, 
 	}
 	graph, graphDiags := b.Build(addr.Module)
 	return graph, diags.Append(graphDiags).ErrWithWarnings()
+}
+
+// objectsToPlan produces a sort of "plan for what to plan", by analyzing the current
+// situation for all of the resource instance objects associated with this node's resource,
+// finding the subset that need to be given the opportunity to create a plan, and
+// gathering together the object-specific information required to actually create that
+// plan as a subsequent step.
+//
+// Before calling this function the given [instances.Expander] must already have the
+// expansion values registered for all of the module calls leading to this resource
+// and for the resource itself, and the given [ImportResolver] must already have
+// all of the import requests related to this resource registered with it.
+//
+// This is intended as the first of two phases, working only with data that we already
+// have in memory. A subsequent step can use the result of this one to decide how to
+// perform all of the I/O required to plan all of the described objects as efficiently
+// as possible while respecting the user's configured concurrency limit.
+//
+//nolint:unused // work in progress
+func (n *nodeExpandPlannableResource) objectsToPlan(stateSync *states.SyncState, expander *instances.Expander, importResolver *ImportResolver) (resourceInstanceObjectsToPlan, tfdiags.Diagnostics) {
+	var diags tfdiags.Diagnostics
+	ret := addrs.MakeMap[addrs.AbsResourceInstance, map[states.DeposedKey]*resourceInstanceObjectToPlan]()
+
+	// This method is intentionally written as a bunch of calls to
+	// free functions that operate only on their direct arguments so
+	// that we can more easily write tests for those individual functions
+	// to cover their individual behaviors, rather than having to test
+	// everything at once in all cases.
+
+	forceReplace := addrs.MakeSet(n.forceReplace...)
+
+	// The module that we're declared in might have multiple instances itself,
+	// so we'll start by resolving those.
+	moduleInstances := expander.ExpandModule(n.Addr.Module)
+
+	// We need to hold the state lock just long enough to inspect the state
+	// objects related to instances of our resource, which therefore avoids
+	// the need to deep-copy those entries. Nothing should be altering the
+	// prior state while we're planning, so we can safely make decisions
+	// based on this information without retaining the lock.
+	{
+		// This is a nested scope to prevent accidentally using state or
+		// perModuleStates below after we've released the lock.
+		state := stateSync.Lock()
+		perModuleStates := state.Resources(n.Addr)
+		// Any resource instances that belong to module instances that
+		// are no longer declared in the configuration need all of
+		// their
+		moreDiags := addResourceInstanceObjectsFromRemovedModuleInstances(moduleInstances, perModuleStates, n.ResolvedProvider, ret)
+		stateSync.Unlock()
+		diags = diags.Append(moreDiags)
+	}
+
+	// Now we'll deal with the resource instances that are associated with
+	// the module instances that _are_ in the desired state.
+	for _, moduleInstance := range moduleInstances {
+		absResourceAddr := n.Addr.Absolute(moduleInstance)
+		resourceState := stateSync.Resource(absResourceAddr)
+
+		instanceAddrs := addrs.MakeSet(expander.ExpandResource(absResourceAddr)...)
+		for _, instanceAddr := range instanceAddrs {
+			priorState := stateSync.ResourceInstance(instanceAddr) // nil for instances that didn't previously exist
+			importTarget := importResolver.GetImport(instanceAddr) // nil for instances that aren't being imported into
+			moreDiags := addResourceInstanceObjectsForResourceInstance(
+				instanceAddr,
+				n.Config,
+				priorState,
+				importTarget,
+				forceReplace.Has(instanceAddr),
+				n.ResolvedProvider,
+				ret,
+			)
+			diags = diags.Append(moreDiags)
+		}
+
+		// We also need to deal with any instances that are in the prior
+		// state but not in the desired state, which therefore need a
+		// "delete" or "forget" action planned for them.
+		for instanceKey, priorState := range resourceState.Instances {
+			instanceAddr := absResourceAddr.Instance(instanceKey)
+			if instanceAddrs.Has(instanceAddr) {
+				continue // This one is in the desired state so we already dealt with it above
+			}
+			importTarget := importResolver.GetImport(instanceAddr) // nil for instances that aren't being imported into
+			moreDiags := addResourceInstanceObjectsForResourceInstance(
+				absResourceAddr.Instance(instanceKey),
+				nil, // indicates that the instance is not in the desired state
+				priorState,
+				importTarget,
+				forceReplace.Has(instanceAddr),
+				n.ResolvedProvider,
+				ret,
+			)
+			diags = diags.Append(moreDiags)
+		}
+	}
+
+	return ret, diags
+}
+
+//nolint:unparam,unused // intentionally returning nil diagnostics so caller is prepared for future work
+func addResourceInstanceObjectsForResourceInstance(
+	addr addrs.AbsResourceInstance,
+	config *configs.Resource, // nil for instances that aren't in the desired state
+	priorState *states.ResourceInstance, // nil for instances that didn't previously exist
+	importTarget *EvaluatedConfigImportTarget, // nil for instances that aren't being imported into
+	forceReplace bool,
+	provider ResolvedProvider,
+	into resourceInstanceObjectsToPlan,
+) tfdiags.Diagnostics {
+	objs := ensureResourceInstanceToPlan(into, addr)
+
+	var stateObj *states.ResourceInstanceObjectSrc
+	if priorState != nil {
+		stateObj = priorState.Current
+	}
+
+	// If either the instance is in the desired state or it has a current
+	// object in the prior state then we need to plan it.
+	if config != nil || stateObj != nil {
+		objs[states.NotDeposed] = &resourceInstanceObjectToPlan{
+			Addr:         addr,
+			DeposedKey:   states.NotDeposed,
+			Config:       config,
+			PriorState:   stateObj,
+			ImportTarget: importTarget,
+			ForceReplace: forceReplace,
+			// TODO: Removed?
+			Provider: provider,
+		}
+	}
+
+	// Any deposed objects are always included with no config to represent
+	// that they are not desired and need to be planned for destruction.
+	for deposedKey, stateObj := range priorState.Deposed {
+		objs[deposedKey] = &resourceInstanceObjectToPlan{
+			Addr:       addr,
+			DeposedKey: deposedKey,
+			Config:     nil, // deposed objects are never in the desired state
+			PriorState: stateObj,
+			Provider:   provider,
+		}
+	}
+
+	return nil // We currently never generate diagnostics
+}
+
+//nolint:unparam // intentionally returning nil diagnostics so caller is prepared for future work
+func addResourceInstanceObjectsFromRemovedModuleInstances(
+	currentModuleInstances []addrs.ModuleInstance,
+	priorStates []*states.Resource,
+	provider ResolvedProvider,
+	into resourceInstanceObjectsToPlan,
+) tfdiags.Diagnostics {
+States:
+	for _, rs := range priorStates {
+		for _, m := range currentModuleInstances {
+			if m.Equal(rs.Addr.Module) {
+				continue States
+			}
+		}
+		// If there is no corresponding element in currentModuleInstances
+		// then all of the existing objects under this module instance address
+		// need to be planned for destruction, which we'll signal by generating
+		// results that have no Config.
+		for instKey, is := range rs.Instances {
+			instAddr := rs.Addr.Instance(instKey)
+			objs := ensureResourceInstanceToPlan(into, instAddr)
+			if is.Current != nil {
+				objs[states.NotDeposed] = &resourceInstanceObjectToPlan{
+					Addr:       instAddr,
+					PriorState: is.Current,
+					Provider:   provider,
+					// TODO: do we need to populate the Removed field?
+				}
+			}
+			for deposedKey, os := range is.Deposed {
+				objs[deposedKey] = &resourceInstanceObjectToPlan{
+					Addr:       instAddr,
+					PriorState: os,
+					Provider:   provider,
+				}
+			}
+		}
+	}
+
+	return nil // We currently never generate diagnostics
+}
+
+// resourceInstanceObjectsToPlan is a type alias for a specific map signature we use
+// to describe a set of resource instance objects that ought to have planning performed
+// against them.
+//
+// A value of this type could be thought of as a "plan for what to plan", which
+// we construct first and then act on separately afterwards just because that leads to two
+// phases that can be understood separately, rather than a single swamp of code dealing with
+// both identifying what needs to be planned and doing the planning at the same time.
+//
+// This is aliased here just because the overall type signature is long and distracting
+// when written repeatedly inline in functions working with this type.
+type resourceInstanceObjectsToPlan = addrs.Map[
+	addrs.AbsResourceInstance,
+	map[states.DeposedKey]*resourceInstanceObjectToPlan,
+]
+
+func ensureResourceInstanceToPlan(into resourceInstanceObjectsToPlan, instAddr addrs.AbsResourceInstance) map[states.DeposedKey]*resourceInstanceObjectToPlan {
+	if !into.Has(instAddr) {
+		into.Put(instAddr, map[states.DeposedKey]*resourceInstanceObjectToPlan{})
+	}
+	return into.Get(instAddr)
+}
+
+// resourceInstanceObjectToPlan represents a single object from an instance of a resource that
+// we've determined needs to have the planning process run against it.
+//
+// Different combinations of populated fields in this type represent different situations that
+// are likely to require different handling in the planning process:
+//
+//   - If Config is nil while PriorState is non-nil then this object is not part of
+//     the current desired state but existed in the prior state, and so we ought to plan to destroy
+//     or forget it, taking into account any information in Removed.
+//
+//   - If PriorState is non-nil while Config is nil then this object has been added to
+//     the desired state since the last plan/apply round and so we're presumably going to
+//     plan to create it or import into it.
+//
+//   - If ImportTarget is set and PriorState is nil then we ought to plan to bind an existing
+//     remote object to the given resource instance address.
+//
+//   - If ForceReplace is set then in any situation where we'd normally produce a no-op or
+//     update action for this object we should produce a "replace" action instead.
+type resourceInstanceObjectToPlan struct {
+	// Addr is the full resource instance address that this object belongs to.
+	Addr addrs.AbsResourceInstance
+
+	// DeposedKey, if set to a value other than [states.NotDeposed], represents the non-current
+	// object that needs to be planned.
+	//
+	// If this is [states.NotDeposed] then the intent is to plan the "current" object associated
+	// with this resource instance.
+	//
+	// When DeposedKey is set, Config is always nil and ForceReplace is always false, because the
+	// only reasonable action to take against a deposed object is to destroy it.
+	DeposedKey states.DeposedKey
+
+	// Config describes the configuration block for the resource that this is an instance of.
+	//
+	// This is nil if the resource block is no longer present in the configuration, or if
+	// this object is describing a dynamic instance of a resource that was in the prior
+	// state but is not included in the current configuration's desired state.
+	Config *configs.Resource
+
+	// PriorState describes the state for this resource instance object created in the previous
+	// plan/apply round.
+	//
+	// This is nil if the resource instance was not declared in the previous round, in which
+	// case this instance (or its whole resource block) have presumably been added to the
+	// configuration since the last round.
+	PriorState *states.ResourceInstanceObjectSrc
+
+	// ImportTarget is set if this plan includes a request to import an existing remote object
+	// into this resource instance address.
+	//
+	// This is nil if there is no import request for this resource instance.
+	ImportTarget *EvaluatedConfigImportTarget
+
+	// Removed describes any "removed" blocks associated with this resource instance.
+	//
+	// This is zero-length if there are no "removed" block targeting this resource instance.
+	Removed []*configs.Removed
+
+	// ForceReplace is set if this resource instance is subject to a "-replace" planning
+	// option, which requests that any no-op or update action for this resource instance
+	// should be treated as a "replace" instead.
+	ForceReplace bool
+
+	// Provider identifies the provider instance that should be used to create the plan for
+	// this resource instance.
+	Provider ResolvedProvider
 }
